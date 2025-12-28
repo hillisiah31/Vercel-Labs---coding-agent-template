@@ -8,12 +8,15 @@ This document provides comprehensive guidance for AI assistants (like Claude Cod
 2. [Architecture](#architecture)
 3. [Codebase Structure](#codebase-structure)
 4. [Database Schema](#database-schema)
-5. [Development Workflows](#development-workflows)
-6. [Security Guidelines](#security-guidelines)
-7. [Code Quality Standards](#code-quality-standards)
-8. [API Conventions](#api-conventions)
-9. [Common Tasks](#common-tasks)
-10. [Testing and Validation](#testing-and-validation)
+5. [AI Agents](#ai-agents)
+6. [Skills System](#skills-system)
+7. [Subagents](#subagents)
+8. [Development Workflows](#development-workflows)
+9. [Security Guidelines](#security-guidelines)
+10. [Code Quality Standards](#code-quality-standards)
+11. [API Conventions](#api-conventions)
+12. [Common Tasks](#common-tasks)
+13. [Testing and Validation](#testing-and-validation)
 
 ---
 
@@ -364,6 +367,675 @@ await db.transaction(async (tx) => {
   await tx.insert(keys).values({ userId: user[0].id, ...keyData })
 })
 ```
+
+---
+
+## AI Agents
+
+This section explains the AI coding agents that power task execution in this codebase.
+
+### Overview
+
+The application supports **6 different AI coding agents**, each with unique capabilities and implementations. Users can select which agent to use when creating a task.
+
+| Agent | CLI Package | Model Support | MCP Support | Session Resumption |
+|-------|-------------|---------------|-------------|-------------------|
+| **Claude Code** | `@anthropic-ai/claude-code` | Yes (via `selectedModel`) | ✅ Yes | ✅ Yes |
+| **Codex** | `openai-codex-cli` | Yes (via `selectedModel`) | ❌ No | ✅ Yes |
+| **Copilot** | `@githubnext/github-copilot-cli` | Yes (via `selectedModel`) | ❌ No | ✅ Yes |
+| **Cursor** | `cursor-ai` | Yes (via `selectedModel`) | ❌ No | ✅ Yes |
+| **Gemini** | `@google/gemini-cli` | Yes (via `selectedModel`) | ❌ No | ❌ No |
+| **OpenCode** | `opencode-cli` | Yes (via `selectedModel`) | ❌ No | ✅ Yes |
+
+### Agent Architecture
+
+All agents follow a common execution pattern:
+
+```typescript
+export async function executeAgentInSandbox(
+  sandbox: Sandbox,
+  instruction: string,
+  agentType: AgentType,
+  logger: TaskLogger,
+  selectedModel?: string,
+  mcpServers?: Connector[],
+  onCancellationCheck?: () => Promise<boolean>,
+  apiKeys?: {...},
+  isResumed?: boolean,
+  sessionId?: string,
+  taskId?: string,
+  agentMessageId?: string,
+): Promise<AgentExecutionResult>
+```
+
+**Execution Flow**:
+1. **Check cancellation** - Verify task hasn't been cancelled
+2. **Install agent CLI** - Install agent package in sandbox (if not already installed)
+3. **Authenticate** - Set up API keys from user or global environment
+4. **Configure** - Create agent config files (model selection, MCP servers, etc.)
+5. **Execute** - Run agent with user's instruction
+6. **Stream logs** - Send real-time output to client via TaskLogger
+7. **Detect changes** - Check if agent made any git changes
+8. **Return result** - Return execution result with success status
+
+### Agent Implementation Files
+
+Each agent has its own implementation file in `lib/sandbox/agents/`:
+
+```
+lib/sandbox/agents/
+├── index.ts          # Main dispatcher (routes to specific agent)
+├── claude.ts         # Claude Code implementation (~471 lines)
+├── codex.ts          # OpenAI Codex implementation (~378 lines)
+├── copilot.ts        # GitHub Copilot implementation (~387 lines)
+├── cursor.ts         # Cursor implementation (~553 lines)
+├── gemini.ts         # Google Gemini implementation (~359 lines)
+└── opencode.ts       # OpenCode implementation (~446 lines)
+```
+
+### Agent-Specific Details
+
+#### Claude Code (`claude.ts`)
+
+- **Package**: `@anthropic-ai/claude-code`
+- **Key Features**:
+  - Full MCP server support
+  - Session resumption for follow-up messages
+  - Configurable model selection
+  - Custom config file generation
+- **Authentication**: Requires `ANTHROPIC_API_KEY`
+- **Config Location**: `$HOME/.config/claude/config.json`
+- **Execution**: `claude --dangerouslySkipHuman --config-file <config>`
+
+#### Codex (`codex.ts`)
+
+- **Package**: `openai-codex-cli`
+- **Key Features**:
+  - Session resumption support
+  - AI Gateway integration
+  - Configurable model selection
+- **Authentication**: Requires `OPENAI_API_KEY` or `AI_GATEWAY_API_KEY`
+- **Execution**: `codex <instruction>`
+
+#### Copilot (`copilot.ts`)
+
+- **Package**: `@githubnext/github-copilot-cli`
+- **Key Features**:
+  - Uses user's GitHub token for authentication
+  - Session resumption support
+  - Model selection support
+- **Authentication**: Requires user's GitHub OAuth token
+- **Execution**: `copilot <instruction>`
+
+#### Cursor (`cursor.ts`)
+
+- **Package**: `cursor-ai`
+- **Key Features**:
+  - Session-based conversation support
+  - Session resumption for follow-ups
+  - Model configuration
+- **Authentication**: Requires `CURSOR_API_KEY`
+- **Execution**: `cursor --session <id> <instruction>`
+
+#### Gemini (`gemini.ts`)
+
+- **Package**: `@google/gemini-cli`
+- **Key Features**:
+  - Google's Gemini models
+  - Model selection support
+- **Authentication**: Requires `GEMINI_API_KEY`
+- **Limitations**: No session resumption
+- **Execution**: `gemini <instruction>`
+
+#### OpenCode (`opencode.ts`)
+
+- **Package**: `opencode-cli`
+- **Key Features**:
+  - Open-source coding agent
+  - Session resumption support
+  - Model configuration
+- **Authentication**: Requires `OPENAI_API_KEY`
+- **Execution**: `opencode --session <id> <instruction>`
+
+### Agent Selection
+
+Users select agents via the UI when creating a task. The selected agent is stored in the `tasks.selectedAgent` field:
+
+```typescript
+// In database schema
+selectedAgent: text('selected_agent', {
+  enum: ['claude', 'codex', 'copilot', 'cursor', 'gemini', 'opencode']
+}).default('claude')
+```
+
+### API Key Management
+
+Agents use a **fallback system** for API keys:
+
+1. **User-provided keys** (from `keys` table) - Takes precedence
+2. **Global environment variables** - Fallback if user hasn't provided keys
+
+Example from `lib/sandbox/agents/index.ts`:
+
+```typescript
+// Temporarily override process.env with user's API keys if provided
+if (apiKeys?.ANTHROPIC_API_KEY) process.env.ANTHROPIC_API_KEY = apiKeys.ANTHROPIC_API_KEY
+if (apiKeys?.OPENAI_API_KEY) process.env.OPENAI_API_KEY = apiKeys.OPENAI_API_KEY
+// ... etc
+```
+
+After execution, original environment variables are restored.
+
+### Adding a New Agent
+
+To add a new agent to the system:
+
+1. **Create agent file**: `lib/sandbox/agents/new-agent.ts`
+2. **Implement execution function**:
+   ```typescript
+   export async function executeNewAgentInSandbox(
+     sandbox: Sandbox,
+     instruction: string,
+     logger: TaskLogger,
+     selectedModel?: string,
+     mcpServers?: Connector[],
+     isResumed?: boolean,
+     sessionId?: string,
+   ): Promise<AgentExecutionResult>
+   ```
+3. **Update agent index**: Add to `lib/sandbox/agents/index.ts`
+4. **Update schema**: Add to enum in `lib/db/schema.ts`
+5. **Add logo**: Create `components/logos/new-agent.tsx`
+6. **Update UI**: Add option to task creation form
+
+### MCP Server Integration (Claude Only)
+
+**Model Context Protocol (MCP)** servers extend Claude Code with additional tools and capabilities.
+
+Users can connect MCP servers via the "Connectors" tab:
+
+```typescript
+// Connector types
+type: 'local' | 'remote'
+
+// Remote MCP servers
+baseUrl: string
+oauthClientId?: string
+oauthClientSecret?: string
+
+// Local MCP servers
+command: string
+
+// Environment variables (encrypted)
+env: Record<string, string>
+```
+
+When executing Claude Code, MCP servers are configured in the agent's config file:
+
+```json
+{
+  "mcpServers": {
+    "server-name": {
+      "url": "https://mcp.example.com",
+      "auth": {
+        "type": "oauth",
+        "clientId": "...",
+        "clientSecret": "..."
+      },
+      "env": {
+        "API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+### Agent Execution Result
+
+All agents return a standardized result:
+
+```typescript
+interface AgentExecutionResult {
+  success: boolean           // Whether execution succeeded
+  output?: string           // Agent's output
+  agentResponse?: string    // Agent's final response/message
+  cliName?: string          // Name of CLI used
+  changesDetected?: boolean // Whether git changes were made
+  error?: string            // Error message if failed
+  streamingLogs?: unknown[] // Real-time logs
+  logs?: LogEntry[]         // Structured log entries
+  sessionId?: string        // Session ID for resumption
+}
+```
+
+### Session Resumption
+
+Most agents support **session resumption**, allowing users to send follow-up messages without restarting:
+
+**How it works**:
+1. Initial task execution creates a session ID
+2. Session ID stored in `tasks.agentSessionId`
+3. Follow-up messages use `isResumed=true` and pass the session ID
+4. Agent CLI reconnects to existing session
+
+**Agents with resumption**:
+- ✅ Claude Code
+- ✅ Codex
+- ✅ Copilot
+- ✅ Cursor
+- ✅ OpenCode
+- ❌ Gemini (no session support)
+
+### Task Logger Integration
+
+All agents use the `TaskLogger` class to stream logs:
+
+```typescript
+// Info messages
+await logger.info('Installing dependencies')
+
+// Commands being executed
+await logger.command('npm install')
+
+// Errors
+await logger.error('Build failed')
+
+// Success messages
+await logger.success('Task completed')
+
+// Progress updates
+await logger.updateProgress(50, 'Running tests')
+```
+
+**Important**: All log messages must use **static strings only** (see Security Guidelines).
+
+---
+
+## Skills System
+
+**Current Status**: This codebase does **not** currently implement a skills system.
+
+### What is a Skills System?
+
+A **skills system** would allow agents to use pre-defined, reusable capabilities or tools to accomplish specific tasks. Think of skills as specialized functions that agents can invoke.
+
+### Why This Doesn't Exist Yet
+
+The current architecture relies on:
+1. **Agent-native capabilities** - Each AI agent (Claude, Codex, etc.) brings its own built-in skills
+2. **MCP servers** - Claude Code can connect to MCP servers for extended capabilities
+3. **Direct CLI execution** - Agents execute directly in sandboxes with full system access
+
+### How a Skills System Could Be Added
+
+If you wanted to implement a skills system in the future, here's the recommended approach:
+
+#### 1. Define Skill Interface
+
+```typescript
+// lib/skills/types.ts
+export interface Skill {
+  id: string
+  name: string
+  description: string
+  category: 'code' | 'testing' | 'deployment' | 'analysis'
+  execute: (context: SkillContext) => Promise<SkillResult>
+}
+
+export interface SkillContext {
+  sandbox: Sandbox
+  logger: TaskLogger
+  task: Task
+  params: Record<string, unknown>
+}
+
+export interface SkillResult {
+  success: boolean
+  output: string
+  error?: string
+}
+```
+
+#### 2. Create Skill Implementations
+
+```typescript
+// lib/skills/code/format.ts
+export const formatCodeSkill: Skill = {
+  id: 'format-code',
+  name: 'Format Code',
+  description: 'Format code using Prettier',
+  category: 'code',
+  execute: async (context) => {
+    const { sandbox, logger } = context
+    await logger.info('Formatting code with Prettier')
+
+    const result = await runInProject(sandbox, 'pnpm', ['format'])
+
+    return {
+      success: result.success,
+      output: result.output || '',
+      error: result.error,
+    }
+  },
+}
+```
+
+#### 3. Create Skill Registry
+
+```typescript
+// lib/skills/registry.ts
+import { Skill } from './types'
+import { formatCodeSkill } from './code/format'
+import { runTestsSkill } from './testing/run-tests'
+
+export class SkillRegistry {
+  private skills = new Map<string, Skill>()
+
+  constructor() {
+    this.register(formatCodeSkill)
+    this.register(runTestsSkill)
+  }
+
+  register(skill: Skill) {
+    this.skills.set(skill.id, skill)
+  }
+
+  get(id: string): Skill | undefined {
+    return this.skills.get(id)
+  }
+
+  list(): Skill[] {
+    return Array.from(this.skills.values())
+  }
+}
+
+export const skillRegistry = new SkillRegistry()
+```
+
+#### 4. Integrate with Agents
+
+Agents could invoke skills through a special syntax or API:
+
+```typescript
+// In agent execution
+if (instruction.includes('@skill:')) {
+  const skillId = extractSkillId(instruction)
+  const skill = skillRegistry.get(skillId)
+
+  if (skill) {
+    const result = await skill.execute({
+      sandbox,
+      logger,
+      task,
+      params: extractParams(instruction),
+    })
+    return result
+  }
+}
+```
+
+#### 5. Database Schema
+
+Add a skills table to track user-defined or custom skills:
+
+```typescript
+export const skills = pgTable('skills', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').references(() => users.id),
+  name: text('name').notNull(),
+  description: text('description'),
+  code: text('code').notNull(), // JavaScript code to execute
+  category: text('category'),
+  isPublic: boolean('is_public').default(false),
+  createdAt: timestamp('created_at').defaultNow(),
+})
+```
+
+### Alternative: Use MCP Servers
+
+Instead of building a custom skills system, you can leverage **MCP servers** (which Claude Code already supports):
+
+- Create MCP servers for specific capabilities
+- Users connect them via the Connectors tab
+- Claude Code can use them during task execution
+
+This approach:
+- ✅ Already implemented for Claude Code
+- ✅ Standard protocol (MCP)
+- ✅ Can be shared across different projects
+- ✅ More flexible and powerful than custom skills
+
+---
+
+## Subagents
+
+**Current Status**: This codebase does **not** currently implement a subagent system.
+
+### What are Subagents?
+
+**Subagents** are specialized AI agents that handle specific subtasks delegated by a main agent. They enable:
+- **Task decomposition** - Breaking complex tasks into smaller pieces
+- **Parallel execution** - Running multiple subtasks simultaneously
+- **Specialization** - Using different agents for different types of work
+
+### Why This Doesn't Exist Yet
+
+The current architecture uses a **single-agent model**:
+1. User creates a task with one selected agent
+2. That agent executes the entire task from start to finish
+3. Follow-up messages go to the same agent session
+
+This is simpler and works well for most use cases.
+
+### When Subagents Would Be Useful
+
+Subagents could improve the system for:
+
+1. **Complex multi-step tasks**:
+   - Main agent: Plans the overall approach
+   - Code subagent: Implements the features
+   - Test subagent: Writes and runs tests
+   - Review subagent: Reviews code quality
+
+2. **Specialized expertise**:
+   - Use Claude for planning and architecture
+   - Use Codex for code generation
+   - Use Gemini for documentation
+
+3. **Parallel execution**:
+   - Multiple subagents work on different files simultaneously
+   - Faster completion for large tasks
+
+### How Subagents Could Be Implemented
+
+Here's a design for adding subagents:
+
+#### 1. Subagent Types
+
+```typescript
+// lib/sandbox/subagents/types.ts
+export interface SubagentTask {
+  id: string
+  type: 'code' | 'test' | 'review' | 'docs' | 'debug'
+  instruction: string
+  agentType: AgentType
+  parentTaskId: string
+  dependencies?: string[] // IDs of subtasks that must complete first
+}
+
+export interface SubagentResult {
+  taskId: string
+  success: boolean
+  output: string
+  changes: GitChange[]
+  error?: string
+}
+```
+
+#### 2. Orchestrator
+
+```typescript
+// lib/sandbox/subagents/orchestrator.ts
+export class SubagentOrchestrator {
+  async executeWithSubagents(
+    mainTask: Task,
+    sandbox: Sandbox,
+    logger: TaskLogger,
+  ): Promise<AgentExecutionResult> {
+    // 1. Main agent analyzes task and creates subtasks
+    const subtasks = await this.planSubtasks(mainTask)
+
+    // 2. Execute subtasks (respecting dependencies)
+    const results = await this.executeSubtasks(subtasks, sandbox, logger)
+
+    // 3. Main agent synthesizes results
+    const finalResult = await this.synthesizeResults(results, sandbox, logger)
+
+    return finalResult
+  }
+
+  private async executeSubtasks(
+    subtasks: SubagentTask[],
+    sandbox: Sandbox,
+    logger: TaskLogger,
+  ): Promise<SubagentResult[]> {
+    const completed = new Map<string, SubagentResult>()
+    const queue = [...subtasks]
+
+    while (queue.length > 0) {
+      // Find subtasks with satisfied dependencies
+      const ready = queue.filter(task =>
+        !task.dependencies ||
+        task.dependencies.every(dep => completed.has(dep))
+      )
+
+      // Execute ready subtasks in parallel
+      const results = await Promise.all(
+        ready.map(task => this.executeSubtask(task, sandbox, logger))
+      )
+
+      // Mark as completed
+      results.forEach(result => completed.set(result.taskId, result))
+
+      // Remove from queue
+      queue.splice(0, ready.length)
+    }
+
+    return Array.from(completed.values())
+  }
+
+  private async executeSubtask(
+    subtask: SubagentTask,
+    sandbox: Sandbox,
+    logger: TaskLogger,
+  ): Promise<SubagentResult> {
+    await logger.info(`Starting subtask: ${subtask.type}`)
+
+    const result = await executeAgentInSandbox(
+      sandbox,
+      subtask.instruction,
+      subtask.agentType,
+      logger,
+    )
+
+    return {
+      taskId: subtask.id,
+      success: result.success,
+      output: result.output || '',
+      changes: await this.detectChanges(sandbox),
+      error: result.error,
+    }
+  }
+}
+```
+
+#### 3. Database Schema
+
+Track subagent executions:
+
+```typescript
+export const subagentTasks = pgTable('subagent_tasks', {
+  id: text('id').primaryKey(),
+  parentTaskId: text('parent_task_id')
+    .notNull()
+    .references(() => tasks.id, { onDelete: 'cascade' }),
+  type: text('type', {
+    enum: ['code', 'test', 'review', 'docs', 'debug'],
+  }).notNull(),
+  agentType: text('agent_type').notNull(),
+  instruction: text('instruction').notNull(),
+  status: text('status', {
+    enum: ['pending', 'running', 'completed', 'failed'],
+  }).notNull(),
+  result: jsonb('result').$type<SubagentResult>(),
+  createdAt: timestamp('created_at').defaultNow(),
+  completedAt: timestamp('completed_at'),
+})
+```
+
+#### 4. UI Integration
+
+Show subagent progress in the task detail view:
+
+```typescript
+// components/task-details.tsx
+<div className="subagents">
+  <h3>Subagents</h3>
+  {subagentTasks.map(subtask => (
+    <SubagentCard
+      key={subtask.id}
+      subtask={subtask}
+      status={subtask.status}
+    />
+  ))}
+</div>
+```
+
+#### 5. Agent Integration
+
+Update main agent execution to support delegation:
+
+```typescript
+// In lib/sandbox/agents/claude.ts
+export async function executeClaudeWithSubagents(
+  sandbox: Sandbox,
+  instruction: string,
+  logger: TaskLogger,
+) {
+  // 1. Ask Claude to plan subtasks
+  const plan = await claudePlanner.analyze(instruction)
+
+  // 2. Create subtasks
+  const subtasks = plan.subtasks.map(st => ({
+    id: generateId(),
+    type: st.type,
+    instruction: st.instruction,
+    agentType: st.recommendedAgent,
+    dependencies: st.dependencies,
+  }))
+
+  // 3. Execute with orchestrator
+  const orchestrator = new SubagentOrchestrator()
+  return await orchestrator.executeWithSubagents(subtasks, sandbox, logger)
+}
+```
+
+### Simpler Alternative: Sequential Agents
+
+Instead of true subagents, you could implement **sequential agent chaining**:
+
+```typescript
+// Execute multiple agents in sequence
+const agents = ['claude', 'codex', 'copilot']
+let context = initialInstruction
+
+for (const agentType of agents) {
+  const result = await executeAgentInSandbox(sandbox, context, agentType, logger)
+  context = `Previous result: ${result.output}\n\nNext step: ...`
+}
+```
+
+This is simpler but less flexible than true subagents.
 
 ---
 
