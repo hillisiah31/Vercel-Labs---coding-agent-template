@@ -17,6 +17,13 @@ This document provides comprehensive guidance for AI assistants (like Claude Cod
 11. [API Conventions](#api-conventions)
 12. [Common Tasks](#common-tasks)
 13. [Testing and Validation](#testing-and-validation)
+14. [Environment Variables Reference](#environment-variables-reference)
+15. [Troubleshooting](#troubleshooting)
+16. [API Reference](#api-reference)
+17. [Deployment Guide](#deployment-guide)
+18. [Examples & Use Cases](#examples--use-cases)
+19. [Monitoring & Debugging](#monitoring--debugging)
+20. [Rate Limiting & Quotas](#rate-limiting--quotas)
 
 ---
 
@@ -1482,6 +1489,1376 @@ For API changes:
 - Environment variables not available at build time
 - Server components using client-only APIs
 - Missing dependencies in `package.json`
+
+---
+
+## Environment Variables Reference
+
+This section documents all environment variables used in the application.
+
+### Required Infrastructure Variables
+
+These must be set by the application administrator:
+
+| Variable | Description | Example | Where Used |
+|----------|-------------|---------|------------|
+| `POSTGRES_URL` | PostgreSQL connection string | `postgresql://user:pass@host/db` | Database connection (`lib/db/client.ts`) |
+| `SANDBOX_VERCEL_TOKEN` | Vercel API token for sandbox creation | `vercel_xxx` | Sandbox creation (`lib/sandbox/config.ts`) |
+| `SANDBOX_VERCEL_TEAM_ID` | Vercel team ID | `team_xxx` | Sandbox creation (`lib/sandbox/config.ts`) |
+| `SANDBOX_VERCEL_PROJECT_ID` | Vercel project ID | `prj_xxx` | Sandbox creation (`lib/sandbox/config.ts`) |
+| `JWE_SECRET` | Base64-encoded secret for session encryption | `openssl rand -base64 32` | Session management (`lib/jwe/`) |
+| `ENCRYPTION_KEY` | 32-byte hex string for data encryption | `openssl rand -hex 32` | Encrypting API keys/tokens (`lib/crypto.ts`) |
+
+### Required Authentication Variables
+
+At least one authentication provider must be configured:
+
+| Variable | Description | Example | Where Used |
+|----------|-------------|---------|------------|
+| `NEXT_PUBLIC_AUTH_PROVIDERS` | Comma-separated list of enabled auth providers | `github,vercel` or `github` | Auth provider selection (`lib/auth/providers.ts`) |
+| `NEXT_PUBLIC_GITHUB_CLIENT_ID` | GitHub OAuth app client ID | `Iv1.xxx` | GitHub OAuth (public) |
+| `GITHUB_CLIENT_SECRET` | GitHub OAuth app client secret | `xxx` | GitHub OAuth (server) |
+| `NEXT_PUBLIC_VERCEL_CLIENT_ID` | Vercel OAuth app client ID | `oac_xxx` | Vercel OAuth (public) |
+| `VERCEL_CLIENT_SECRET` | Vercel OAuth app client secret | `xxx` | Vercel OAuth (server) |
+
+### Optional AI Agent API Keys
+
+These can be set globally (fallback for all users) or left unset to require per-user configuration:
+
+| Variable | Description | Agent(s) | Where Used |
+|----------|-------------|----------|------------|
+| `ANTHROPIC_API_KEY` | Anthropic API key | Claude Code | `lib/sandbox/agents/claude.ts` |
+| `OPENAI_API_KEY` | OpenAI API key | Codex, OpenCode | `lib/sandbox/agents/codex.ts`, `lib/sandbox/agents/opencode.ts` |
+| `AI_GATEWAY_API_KEY` | Vercel AI Gateway API key | Codex, branch naming, title generation | `lib/sandbox/agents/codex.ts`, `lib/utils/branch-name-generator.ts` |
+| `CURSOR_API_KEY` | Cursor API key | Cursor | `lib/sandbox/agents/cursor.ts` |
+| `GEMINI_API_KEY` | Google Gemini API key | Gemini | `lib/sandbox/agents/gemini.ts` |
+
+### Optional Configuration Variables
+
+| Variable | Description | Default | Where Used |
+|----------|-------------|---------|------------|
+| `MAX_SANDBOX_DURATION` | Default max sandbox duration (minutes) | `300` (5 hours) | `lib/constants.ts`, `lib/db/schema.ts` |
+| `MAX_MESSAGES_PER_DAY` | Default max tasks + messages per user per day | `5` | `lib/constants.ts`, `lib/utils/rate-limit.ts` |
+| `NPM_TOKEN` | NPM token for private packages | - | Sandbox dependency installation |
+| `NODE_ENV` | Node environment | `development` | Cookie security settings |
+
+### Variable Precedence
+
+For API keys, the system uses a fallback chain:
+
+1. **User-provided keys** (stored in `keys` table) - Highest priority
+2. **Global environment variables** - Fallback if user hasn't provided keys
+3. **Error** - If neither is available and required for the selected agent
+
+Example from `lib/sandbox/agents/index.ts`:
+```typescript
+// User keys override environment variables
+if (apiKeys?.ANTHROPIC_API_KEY) process.env.ANTHROPIC_API_KEY = apiKeys.ANTHROPIC_API_KEY
+if (apiKeys?.OPENAI_API_KEY) process.env.OPENAI_API_KEY = apiKeys.OPENAI_API_KEY
+```
+
+---
+
+## Troubleshooting
+
+Common issues and their solutions.
+
+### Database Connection Errors
+
+**Error**: `No PostgreSQL connection string found`
+
+**Cause**: `POSTGRES_URL` environment variable not set
+
+**Solution**:
+```bash
+# Set in .env.local for local development
+POSTGRES_URL=postgresql://user:password@localhost:5432/database
+
+# Or use Vercel Postgres
+# Set via Vercel dashboard → Storage → Connect
+```
+
+**Error**: `Database migration failed`
+
+**Cause**: Schema changes not applied or database out of sync
+
+**Solution**:
+```bash
+# Regenerate migrations
+pnpm db:generate
+
+# Apply to database
+pnpm db:push
+
+# Or use migration script for production
+npx tsx scripts/migrate-production.ts
+```
+
+### Sandbox Timeout Issues
+
+**Error**: `Sandbox creation timeout`
+
+**Cause**: Vercel sandbox API slow or unavailable
+
+**Solution**:
+- Check `SANDBOX_VERCEL_TOKEN`, `SANDBOX_VERCEL_TEAM_ID`, `SANDBOX_VERCEL_PROJECT_ID` are correct
+- Verify Vercel account has sandbox quota available
+- Try increasing `maxDuration` when creating task
+
+**Error**: `Sandbox expired before task completed`
+
+**Cause**: Task execution exceeded `maxDuration`
+
+**Solution**:
+- Increase `maxDuration` when creating task (up to 300 minutes)
+- Enable `keepAlive` to preserve sandbox after completion
+- Optimize agent prompt to reduce execution time
+
+### Authentication Failures
+
+**Error**: `Unauthorized - No session found`
+
+**Cause**: Session cookie expired or missing
+
+**Solution**:
+- Sign out and sign in again
+- Check `JWE_SECRET` is set and hasn't changed
+- Verify cookies are enabled in browser
+- Check cookie domain matches deployment URL
+
+**Error**: `OAuth callback failed`
+
+**Cause**: OAuth app configuration mismatch
+
+**Solution**:
+```bash
+# Verify callback URLs match OAuth app settings
+# GitHub: http://localhost:3000/api/auth/github/callback
+# Vercel: http://localhost:3000/api/auth/callback/vercel
+
+# Check client IDs match
+echo $NEXT_PUBLIC_GITHUB_CLIENT_ID
+echo $NEXT_PUBLIC_VERCEL_CLIENT_ID
+```
+
+### Git Operation Errors
+
+**Error**: `Failed to push to branch`
+
+**Cause**: No GitHub authentication or insufficient permissions
+
+**Solution**:
+- Users who signed in with Vercel must connect GitHub account (Profile → Connect GitHub)
+- Users who signed in with GitHub are automatically connected
+- Verify repository exists and user has write access
+
+**Error**: `Branch name validation failed`
+
+**Cause**: Branch name doesn't match required pattern `claude/<name>-<session-id>`
+
+**Solution**:
+- AI-generated branch names automatically match pattern
+- If manually setting, ensure format: `claude/feature-name-ABC123`
+- Session ID must be 6 alphanumeric characters
+
+### MCP Server Connection Problems
+
+**Error**: `MCP server connection failed`
+
+**Cause**: Server URL incorrect or authentication missing
+
+**Solution**:
+- Verify `baseUrl` is correct and accessible
+- Check `oauthClientId` and `oauthClientSecret` if using OAuth
+- Ensure `ENCRYPTION_KEY` is set (required for encrypted credentials)
+- Test MCP server independently before connecting
+
+### Build/Type Errors
+
+**Error**: `Type 'X' is not assignable to type 'Y'`
+
+**Solution**:
+```bash
+# Run type check to see all errors
+pnpm type-check
+
+# Common fixes:
+# - Add missing imports
+# - Use proper Drizzle inferred types from schema
+# - Add type assertions where needed (use sparingly)
+```
+
+**Error**: `Build failed - Cannot find module`
+
+**Solution**:
+```bash
+# Reinstall dependencies
+rm -rf node_modules pnpm-lock.yaml
+pnpm install
+
+# Check import paths use @ alias correctly
+# Good: import { db } from '@/lib/db/client'
+# Bad: import { db } from '../../lib/db/client'
+```
+
+### Rate Limiting Issues
+
+**Error**: `Rate limit exceeded`
+
+**Cause**: User reached `MAX_MESSAGES_PER_DAY` limit
+
+**Solution**:
+```bash
+# Check current limit
+curl http://localhost:3000/api/auth/rate-limit
+
+# Increase global limit (environment variable)
+MAX_MESSAGES_PER_DAY=10
+
+# Or set per-user limit in database
+# INSERT INTO settings (user_id, key, value)
+# VALUES ('user-id', 'maxMessagesPerDay', '20')
+```
+
+**How rate limiting works**:
+- Counts new tasks + follow-up messages per user per UTC day
+- Resets at midnight UTC
+- User-specific settings override global `MAX_MESSAGES_PER_DAY`
+
+### Agent Execution Failures
+
+**Error**: `ANTHROPIC_API_KEY is required`
+
+**Cause**: Claude Code selected but no API key configured
+
+**Solution**:
+- Add API key in Profile → API Keys
+- Or set `ANTHROPIC_API_KEY` environment variable globally
+
+**Error**: `Agent CLI installation failed`
+
+**Cause**: npm registry timeout or package unavailable
+
+**Solution**:
+- Check sandbox network connectivity
+- Verify npm package name is correct in agent file
+- Try again (sandbox will cache successful installs)
+
+---
+
+## API Reference
+
+Complete documentation of all API endpoints.
+
+### Authentication Endpoints
+
+#### `POST /api/auth/signin/github`
+Initiate GitHub OAuth flow
+
+**Auth Required**: No
+**Response**: Redirects to GitHub OAuth
+
+#### `POST /api/auth/signin/vercel`
+Initiate Vercel OAuth flow
+
+**Auth Required**: No
+**Response**: Redirects to Vercel OAuth
+
+#### `GET /api/auth/github/callback`
+GitHub OAuth callback handler
+
+**Auth Required**: No
+**Response**: Sets session cookie, redirects to app
+
+#### `GET /api/auth/callback/vercel`
+Vercel OAuth callback handler
+
+**Auth Required**: No
+**Response**: Sets session cookie, redirects to app
+
+#### `POST /api/auth/signout`
+Sign out current user
+
+**Auth Required**: Yes
+**Response**: Clears session cookie
+```json
+{ "success": true }
+```
+
+#### `GET /api/auth/info`
+Get current user session info
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "user": {
+    "id": "user-id",
+    "username": "username",
+    "email": "email@example.com",
+    "provider": "github"
+  }
+}
+```
+
+#### `GET /api/auth/rate-limit`
+Check rate limit status for current user
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "allowed": true,
+  "remaining": 3,
+  "total": 5,
+  "resetAt": "2024-12-25T00:00:00.000Z"
+}
+```
+
+#### `GET /api/auth/github/status`
+Check if user has GitHub connected
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "connected": true,
+  "username": "octocat"
+}
+```
+
+#### `POST /api/auth/github/disconnect`
+Disconnect GitHub account
+
+**Auth Required**: Yes
+**Response**:
+```json
+{ "success": true }
+```
+
+### Task Endpoints
+
+#### `GET /api/tasks`
+List all tasks for current user
+
+**Auth Required**: Yes
+**Query Params**:
+- `includeDeleted`: Include soft-deleted tasks (optional)
+
+**Response**:
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "task-id",
+      "prompt": "Add user authentication",
+      "status": "completed",
+      "progress": 100,
+      "branchName": "claude/add-auth-A1b2C3",
+      "createdAt": "2024-12-24T10:00:00.000Z"
+    }
+  ]
+}
+```
+
+#### `POST /api/tasks`
+Create a new task
+
+**Auth Required**: Yes
+**Request Body**:
+```json
+{
+  "prompt": "Add user authentication",
+  "repoUrl": "https://github.com/user/repo",
+  "selectedAgent": "claude",
+  "selectedModel": "claude-3-5-sonnet-20241022",
+  "installDependencies": false,
+  "maxDuration": 60,
+  "keepAlive": true,
+  "mcpServerIds": ["connector-id"]
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "data": {
+    "id": "task-id",
+    "status": "pending"
+  }
+}
+```
+
+#### `GET /api/tasks/[taskId]`
+Get specific task details
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "success": true,
+  "data": {
+    "id": "task-id",
+    "prompt": "Add user authentication",
+    "status": "processing",
+    "progress": 45,
+    "logs": [
+      { "type": "info", "message": "Installing dependencies" }
+    ],
+    "sandboxUrl": "https://sandbox-id.vercel.app"
+  }
+}
+```
+
+#### `DELETE /api/tasks/[taskId]`
+Soft delete a task
+
+**Auth Required**: Yes
+**Response**:
+```json
+{ "success": true }
+```
+
+#### `POST /api/tasks/[taskId]/continue`
+Send follow-up message to task
+
+**Auth Required**: Yes
+**Request Body**:
+```json
+{
+  "message": "Add tests for the authentication"
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "data": { "messageId": "msg-id" }
+}
+```
+
+### Sandbox Endpoints
+
+#### `POST /api/tasks/[taskId]/start-sandbox`
+Manually start/restart sandbox
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "success": true,
+  "sandboxId": "sbx_xxx",
+  "sandboxUrl": "https://sbx-xxx.vercel.app"
+}
+```
+
+#### `POST /api/tasks/[taskId]/stop-sandbox`
+Stop running sandbox
+
+**Auth Required**: Yes
+**Response**:
+```json
+{ "success": true }
+```
+
+#### `GET /api/tasks/[taskId]/sandbox-health`
+Check sandbox health status
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "healthy": true,
+  "status": "running"
+}
+```
+
+### File Operation Endpoints
+
+#### `GET /api/tasks/[taskId]/files`
+List files in task repository
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "files": [
+    {
+      "path": "src/index.ts",
+      "type": "file",
+      "size": 1024
+    }
+  ]
+}
+```
+
+#### `GET /api/tasks/[taskId]/file-content`
+Get file content
+
+**Auth Required**: Yes
+**Query Params**:
+- `path`: File path (required)
+
+**Response**:
+```json
+{
+  "content": "file content here",
+  "path": "src/index.ts"
+}
+```
+
+#### `POST /api/tasks/[taskId]/save-file`
+Save file changes
+
+**Auth Required**: Yes
+**Request Body**:
+```json
+{
+  "path": "src/index.ts",
+  "content": "updated content"
+}
+```
+
+**Response**:
+```json
+{ "success": true }
+```
+
+### Repository Endpoints
+
+#### `GET /api/github/repos`
+List user's GitHub repositories
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "repositories": [
+    {
+      "name": "my-repo",
+      "full_name": "user/my-repo",
+      "private": false,
+      "url": "https://github.com/user/my-repo"
+    }
+  ]
+}
+```
+
+#### `GET /api/repos/[owner]/[repo]/commits`
+Get repository commits
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "commits": [
+    {
+      "sha": "abc123",
+      "message": "Add feature",
+      "author": "username",
+      "date": "2024-12-24T10:00:00Z"
+    }
+  ]
+}
+```
+
+### API Key Endpoints
+
+#### `GET /api/api-keys`
+Get user's configured API keys (values masked)
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "keys": {
+    "anthropic": "sk-ant-***",
+    "openai": "sk-***",
+    "cursor": null
+  }
+}
+```
+
+#### `POST /api/api-keys`
+Set or update API key
+
+**Auth Required**: Yes
+**Request Body**:
+```json
+{
+  "provider": "anthropic",
+  "value": "sk-ant-api-key-here"
+}
+```
+
+**Response**:
+```json
+{ "success": true }
+```
+
+#### `DELETE /api/api-keys`
+Delete API key
+
+**Auth Required**: Yes
+**Query Params**:
+- `provider`: Provider name (required)
+
+**Response**:
+```json
+{ "success": true }
+```
+
+### Connector Endpoints
+
+#### `GET /api/connectors`
+List user's MCP connectors
+
+**Auth Required**: Yes
+**Response**:
+```json
+{
+  "connectors": [
+    {
+      "id": "conn-id",
+      "name": "Convex MCP",
+      "type": "remote",
+      "status": "connected"
+    }
+  ]
+}
+```
+
+#### `POST /api/connectors`
+Create MCP connector
+
+**Auth Required**: Yes
+**Request Body**:
+```json
+{
+  "name": "My MCP Server",
+  "type": "remote",
+  "baseUrl": "https://mcp.example.com",
+  "env": {
+    "API_KEY": "secret"
+  }
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "data": { "id": "conn-id" }
+}
+```
+
+---
+
+## Deployment Guide
+
+Step-by-step guide for deploying to production.
+
+### Prerequisites
+
+- Vercel account
+- GitHub account (for OAuth)
+- PostgreSQL database (Neon recommended)
+- Domain name (optional)
+
+### One-Click Deployment
+
+1. **Click Deploy Button**:
+   - Go to repository README
+   - Click "Deploy with Vercel" button
+   - Follow Vercel deployment wizard
+
+2. **Configure Environment Variables**:
+   ```bash
+   # Required (will be prompted)
+   SANDBOX_VERCEL_TEAM_ID=team_xxx
+   SANDBOX_VERCEL_PROJECT_ID=prj_xxx
+   SANDBOX_VERCEL_TOKEN=vercel_xxx
+   JWE_SECRET=$(openssl rand -base64 32)
+   ENCRYPTION_KEY=$(openssl rand -hex 32)
+   ```
+
+3. **Database Auto-Setup**:
+   - Vercel will prompt to create Neon Postgres database
+   - `POSTGRES_URL` automatically set
+   - Database migrations run automatically on first deploy
+
+4. **Configure OAuth**:
+   - After deployment, go to Vercel project settings
+   - Add environment variables:
+   ```bash
+   NEXT_PUBLIC_AUTH_PROVIDERS=github
+   NEXT_PUBLIC_GITHUB_CLIENT_ID=Iv1_xxx
+   GITHUB_CLIENT_SECRET=xxx
+   ```
+
+5. **Create GitHub OAuth App**:
+   - Go to GitHub Settings → Developer settings → OAuth Apps
+   - New OAuth App
+   - Set callback URL: `https://your-domain.vercel.app/api/auth/github/callback`
+   - Copy Client ID and Secret to Vercel environment variables
+
+6. **Redeploy**:
+   - Trigger redeployment in Vercel dashboard
+   - OAuth will now work
+
+### Manual Deployment
+
+1. **Clone Repository**:
+   ```bash
+   git clone https://github.com/vercel-labs/coding-agent-template.git
+   cd coding-agent-template
+   ```
+
+2. **Install Vercel CLI**:
+   ```bash
+   npm i -g vercel
+   vercel login
+   ```
+
+3. **Link Project**:
+   ```bash
+   vercel link
+   ```
+
+4. **Set Environment Variables**:
+   ```bash
+   vercel env add POSTGRES_URL production
+   vercel env add SANDBOX_VERCEL_TOKEN production
+   vercel env add SANDBOX_VERCEL_TEAM_ID production
+   vercel env add SANDBOX_VERCEL_PROJECT_ID production
+   vercel env add JWE_SECRET production
+   vercel env add ENCRYPTION_KEY production
+   vercel env add NEXT_PUBLIC_AUTH_PROVIDERS production
+   vercel env add NEXT_PUBLIC_GITHUB_CLIENT_ID production
+   vercel env add GITHUB_CLIENT_SECRET production
+   ```
+
+5. **Deploy**:
+   ```bash
+   vercel --prod
+   ```
+
+### Database Migration on Production
+
+**Automatic (Recommended)**:
+- Migrations run automatically on deployment via `npm run build`
+- Uses `drizzle-kit push` in `postinstall` script
+
+**Manual**:
+```bash
+# From local machine with production POSTGRES_URL
+export POSTGRES_URL=postgresql://...
+pnpm db:push
+
+# Or use migration script
+npx tsx scripts/migrate-production.ts
+```
+
+### Post-Deployment Verification
+
+1. **Test Authentication**:
+   - Visit your deployed URL
+   - Click "Sign in with GitHub"
+   - Verify OAuth flow completes successfully
+
+2. **Create Test Task**:
+   - Create a simple task
+   - Verify sandbox creation works
+   - Check agent execution completes
+
+3. **Check Logs**:
+   ```bash
+   vercel logs
+   ```
+
+4. **Verify Database**:
+   - Connect to database
+   - Check tables exist: `users`, `tasks`, `keys`, etc.
+   - Verify test data appears
+
+### Custom Domain Setup
+
+1. **Add Domain in Vercel**:
+   - Project Settings → Domains
+   - Add your domain
+   - Configure DNS records as prompted
+
+2. **Update OAuth Callback URLs**:
+   - GitHub OAuth App settings
+   - Add production callback: `https://yourdomain.com/api/auth/github/callback`
+   - Keep localhost for development
+
+3. **Update Environment Variables**:
+   - No changes needed (callbacks are dynamic)
+
+### Rollback Procedures
+
+**Revert to Previous Deployment**:
+```bash
+# Via Vercel dashboard
+# Deployments → [previous deployment] → Promote to Production
+
+# Or via CLI
+vercel rollback
+```
+
+**Revert Database Migration**:
+```bash
+# Connect to database and manually revert changes
+# Or restore from database backup
+```
+
+### Monitoring Production
+
+- **Vercel Dashboard**: Monitor deployment status, errors, analytics
+- **Database Logs**: Check Neon dashboard for query performance
+- **Error Tracking**: Check Vercel logs for runtime errors
+
+---
+
+## Examples & Use Cases
+
+Real-world examples of using the coding agent template.
+
+### Example 1: Add User Authentication
+
+**Task Prompt**:
+```
+Add user authentication to this Next.js app using NextAuth.js with GitHub provider.
+Include sign in/sign out buttons in the header and protect the /dashboard route.
+```
+
+**Configuration**:
+- Agent: Claude Code
+- Model: `claude-3-5-sonnet-20241022`
+- Install Dependencies: Yes
+- Max Duration: 30 minutes
+- Keep Alive: Yes (for testing)
+
+**Expected Outcome**:
+- Creates branch: `claude/add-user-authentication-A1b2C3`
+- Installs `next-auth` package
+- Creates `/api/auth/[...nextauth]/route.ts`
+- Adds sign in/out buttons
+- Protects `/dashboard` route
+- Creates PR with changes
+
+### Example 2: Fix TypeScript Errors
+
+**Task Prompt**:
+```
+Fix all TypeScript errors in the codebase. Run `pnpm type-check` to find them,
+then fix each error. Make sure the build passes when you're done.
+```
+
+**Configuration**:
+- Agent: Claude Code
+- Model: `claude-3-5-sonnet-20241022`
+- Install Dependencies: No (already installed)
+- Max Duration: 15 minutes
+- Keep Alive: No
+
+**Expected Outcome**:
+- Finds TypeScript errors via `pnpm type-check`
+- Fixes type mismatches
+- Runs `pnpm build` to verify
+- Commits with descriptive message
+
+### Example 3: Add API Endpoint
+
+**Task Prompt**:
+```
+Create a new API endpoint at /api/users/[userId] that returns user profile data.
+Include GET endpoint with proper authentication and error handling.
+Add Zod validation for the userId parameter.
+```
+
+**Configuration**:
+- Agent: Cursor
+- Model: Default
+- Install Dependencies: No
+- Max Duration: 10 minutes
+- Keep Alive: No
+
+**Expected Outcome**:
+- Creates `app/api/users/[userId]/route.ts`
+- Implements GET handler with session check
+- Adds Zod validation
+- Returns standardized JSON response
+- Includes error handling
+
+### Example 4: Multi-Step Task with Follow-ups
+
+**Initial Prompt**:
+```
+Create a blog post component that displays a title, date, and content.
+Style it with Tailwind CSS.
+```
+
+**Follow-up Message 1**:
+```
+Add a featured image to the component with lazy loading.
+```
+
+**Follow-up Message 2**:
+```
+Add author information with avatar and bio.
+```
+
+**Configuration**:
+- Agent: Claude Code
+- Keep Alive: Yes (required for follow-ups)
+- Max Duration: 60 minutes
+
+**How It Works**:
+1. Initial task creates basic component
+2. Session ID stored in `tasks.agentSessionId`
+3. Follow-up messages resume same session
+4. Agent maintains context across messages
+5. All changes committed to same branch
+
+### Example 5: MCP Server Usage
+
+**Prerequisite**: Connect Convex MCP server in Connectors tab
+
+**Task Prompt**:
+```
+Set up Convex in this project. Create a simple counter mutation and query.
+Add a button to increment the counter and display the current value.
+```
+
+**Configuration**:
+- Agent: Claude Code (only agent with MCP support)
+- MCP Servers: Select "Convex" connector
+- Install Dependencies: Yes
+- Max Duration: 30 minutes
+
+**Expected Outcome**:
+- Agent uses Convex MCP tools
+- Sets up Convex configuration
+- Creates mutations and queries
+- Implements UI with real-time updates
+
+### Example 6: Testing an Existing Feature
+
+**Task Prompt**:
+```
+The authentication system seems broken. Debug why users can't sign in.
+Check the OAuth callback handler and session creation logic.
+```
+
+**Configuration**:
+- Agent: Claude Code
+- Keep Alive: Yes (for investigation)
+- Max Duration: 45 minutes
+
+**Workflow**:
+1. Agent reads authentication code
+2. Identifies issue in callback handler
+3. Suggests fix or implements it
+4. Tests the fix in sandbox
+5. Commits working solution
+
+### Common Workflows
+
+**Feature Development**:
+1. Create task with feature description
+2. Agent implements feature
+3. Enable Keep Alive to test in sandbox
+4. Send follow-up to fix issues
+5. Review changes and merge PR
+
+**Bug Fixing**:
+1. Describe bug and reproduction steps
+2. Agent investigates codebase
+3. Identifies and fixes root cause
+4. Verifies fix works
+5. Merge PR
+
+**Refactoring**:
+1. Specify what to refactor and why
+2. Agent analyzes code
+3. Makes improvements
+4. Ensures tests still pass
+5. Review and merge
+
+---
+
+## Monitoring & Debugging
+
+Tools and techniques for monitoring and debugging the application.
+
+### Viewing Task Logs
+
+**In UI**:
+- Navigate to task detail page
+- Logs pane shows real-time execution
+- Filter by log type (info, command, error, success)
+
+**In Database**:
+```sql
+SELECT logs FROM tasks WHERE id = 'task-id';
+```
+
+Returns structured log array:
+```json
+[
+  { "type": "info", "message": "Installing dependencies" },
+  { "type": "command", "message": "pnpm install" },
+  { "type": "error", "message": "Build failed" }
+]
+```
+
+### Database Query Debugging
+
+**Enable Query Logging** (development only):
+```typescript
+// lib/db/client.ts
+const client = postgres(process.env.POSTGRES_URL!, {
+  debug: true, // Logs all queries
+})
+```
+
+**Common Queries**:
+```sql
+-- Find failed tasks
+SELECT id, prompt, error, created_at
+FROM tasks
+WHERE status = 'error'
+ORDER BY created_at DESC
+LIMIT 10;
+
+-- Check user's task count
+SELECT COUNT(*)
+FROM tasks
+WHERE user_id = 'user-id'
+AND deleted_at IS NULL;
+
+-- Find tasks with specific error
+SELECT id, prompt, error
+FROM tasks
+WHERE error LIKE '%timeout%';
+```
+
+### Sandbox Execution Monitoring
+
+**Check Sandbox Status**:
+```typescript
+// GET /api/tasks/[taskId]/sandbox-health
+const response = await fetch(`/api/tasks/${taskId}/sandbox-health`)
+const { healthy, status } = await response.json()
+```
+
+**View Sandbox Logs** (via Vercel):
+```bash
+# Install Vercel CLI
+npm i -g vercel
+
+# View logs for specific sandbox
+vercel logs --filter=sandbox_id
+```
+
+**Common Sandbox Issues**:
+- **Timeout**: Increase `maxDuration` or optimize task
+- **Out of Memory**: Sandbox has resource limits
+- **Network Error**: Check Vercel status
+
+### Performance Profiling
+
+**Slow Database Queries**:
+```sql
+-- Find slow queries (Neon dashboard)
+SELECT query, calls, total_time, mean_time
+FROM pg_stat_statements
+ORDER BY mean_time DESC
+LIMIT 10;
+```
+
+**Client-Side Performance**:
+```javascript
+// Add to layout.tsx for development
+if (process.env.NODE_ENV === 'development') {
+  console.log('Performance metrics:', performance.getEntriesByType('navigation'))
+}
+```
+
+### Error Tracking
+
+**Server-Side Errors**:
+- Check Vercel dashboard → Logs
+- Filter by error severity
+- View stack traces
+
+**Client-Side Errors**:
+```typescript
+// Add error boundary
+'use client'
+
+export default function ErrorBoundary({ error }: { error: Error }) {
+  console.error('Client error:', error)
+  return <div>Something went wrong</div>
+}
+```
+
+**Common Error Patterns**:
+```bash
+# Search logs for patterns
+vercel logs | grep "ANTHROPIC_API_KEY is required"
+vercel logs | grep "Rate limit exceeded"
+vercel logs | grep "Sandbox creation timeout"
+```
+
+### Health Checks
+
+**Application Health**:
+```bash
+# Check if app is responding
+curl https://your-domain.com
+
+# Check database connection
+curl https://your-domain.com/api/auth/info
+```
+
+**Database Health**:
+```sql
+-- Check active connections
+SELECT COUNT(*) FROM pg_stat_activity;
+
+-- Check table sizes
+SELECT
+  schemaname,
+  tablename,
+  pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS size
+FROM pg_tables
+WHERE schemaname = 'public'
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
+```
+
+### Debugging Tips
+
+**Agent Execution Issues**:
+1. Check logs for agent CLI installation
+2. Verify API keys are present (check `/api/api-keys/check`)
+3. Look for timeout or network errors
+4. Try simpler prompt to isolate issue
+
+**Database Issues**:
+1. Verify `POSTGRES_URL` is correct
+2. Check connection pool isn't exhausted
+3. Look for migration errors in deployment logs
+4. Verify schema matches expected structure
+
+**Authentication Issues**:
+1. Check session cookie exists
+2. Verify `JWE_SECRET` hasn't changed
+3. Look for OAuth errors in logs
+4. Test with different browser (clear cache)
+
+---
+
+## Rate Limiting & Quotas
+
+Understanding and configuring rate limits.
+
+### How Rate Limiting Works
+
+The system tracks **tasks created + follow-up messages** per user per UTC day:
+
+```typescript
+// Calculation in lib/utils/rate-limit.ts
+const tasksToday = await db.select()
+  .from(tasks)
+  .where(and(
+    eq(tasks.userId, userId),
+    gte(tasks.createdAt, today)
+  ))
+
+const messagesFromUser = await db.select()
+  .from(taskMessages)
+  .where(and(
+    eq(taskMessages.role, 'user'),
+    gte(taskMessages.createdAt, today)
+  ))
+
+const totalCount = tasksToday.length + messagesFromUser.length
+```
+
+**Reset Time**: Midnight UTC every day
+
+### Default Limits
+
+| Setting | Default Value | Environment Variable |
+|---------|---------------|---------------------|
+| Max Messages Per Day | 5 | `MAX_MESSAGES_PER_DAY` |
+| Max Sandbox Duration | 300 minutes (5 hours) | `MAX_SANDBOX_DURATION` |
+
+### Checking Rate Limit Status
+
+**API Endpoint**:
+```bash
+curl -X GET http://localhost:3000/api/auth/rate-limit \
+  -H "Cookie: session=..."
+```
+
+**Response**:
+```json
+{
+  "allowed": true,      // Can create new task/message
+  "remaining": 3,       // Messages left today
+  "total": 5,          // Total allowed per day
+  "resetAt": "2024-12-25T00:00:00.000Z"  // When limit resets
+}
+```
+
+**In Code**:
+```typescript
+import { checkRateLimit } from '@/lib/utils/rate-limit'
+
+const { allowed, remaining, total, resetAt } = await checkRateLimit(userId)
+
+if (!allowed) {
+  return Response.json(
+    { error: `Rate limit exceeded. Resets at ${resetAt}` },
+    { status: 429 }
+  )
+}
+```
+
+### Configuring Global Limits
+
+**Via Environment Variable**:
+```bash
+# .env.local or Vercel environment variables
+MAX_MESSAGES_PER_DAY=10
+MAX_SANDBOX_DURATION=180  # 3 hours in minutes
+```
+
+**In Database** (per-user override):
+```sql
+-- Set custom limit for specific user
+INSERT INTO settings (id, user_id, key, value)
+VALUES (
+  gen_random_uuid(),
+  'user-id-here',
+  'maxMessagesPerDay',
+  '20'
+);
+
+-- Set custom sandbox duration
+INSERT INTO settings (id, user_id, key, value)
+VALUES (
+  gen_random_uuid(),
+  'user-id-here',
+  'maxSandboxDuration',
+  '480'  -- 8 hours
+);
+```
+
+### Limit Precedence
+
+1. **User-specific settings** (in `settings` table) - Highest priority
+2. **Global environment variable** (`MAX_MESSAGES_PER_DAY`)
+3. **Hardcoded default** (5 messages/day)
+
+Example from `lib/db/settings.ts`:
+```typescript
+export async function getMaxMessagesPerDay(userId?: string): Promise<number> {
+  // 1. Check user-specific setting
+  const userSetting = await getNumericSetting('maxMessagesPerDay', userId)
+
+  // 2. Fall back to environment variable
+  // 3. Fall back to hardcoded default (5)
+  return userSetting ?? MAX_MESSAGES_PER_DAY
+}
+```
+
+### Bypassing Rate Limits
+
+**For Development**:
+```bash
+# Set very high limit
+MAX_MESSAGES_PER_DAY=9999
+```
+
+**For Production VIP Users**:
+```sql
+-- Give specific users higher limits
+INSERT INTO settings (id, user_id, key, value)
+VALUES (gen_random_uuid(), 'vip-user-id', 'maxMessagesPerDay', '100');
+```
+
+**Disable Entirely** (not recommended for production):
+```typescript
+// In lib/utils/rate-limit.ts
+export async function checkRateLimit(userId: string) {
+  return {
+    allowed: true,
+    remaining: 999,
+    total: 999,
+    resetAt: new Date(),
+  }
+}
+```
+
+### Rate Limit Errors
+
+When limit is exceeded, users see:
+```json
+{
+  "error": "Rate limit exceeded. You've reached your daily limit of 5 messages. Limit resets at 2024-12-25T00:00:00.000Z"
+}
+```
+
+**In UI**: Display friendly message with reset time
+**Status Code**: `429 Too Many Requests`
+
+### Monitoring Usage
+
+**Check usage across all users**:
+```sql
+SELECT
+  u.username,
+  COUNT(t.id) as tasks_today,
+  COUNT(tm.id) as messages_today,
+  COUNT(t.id) + COUNT(tm.id) as total_today
+FROM users u
+LEFT JOIN tasks t ON t.user_id = u.id
+  AND t.created_at >= CURRENT_DATE
+  AND t.deleted_at IS NULL
+LEFT JOIN task_messages tm ON tm.task_id IN (
+  SELECT id FROM tasks WHERE user_id = u.id
+) AND tm.created_at >= CURRENT_DATE
+  AND tm.role = 'user'
+GROUP BY u.id, u.username
+ORDER BY total_today DESC;
+```
+
+**Find users hitting limits**:
+```sql
+SELECT username, COUNT(*) as count
+FROM tasks t
+JOIN users u ON t.user_id = u.id
+WHERE t.created_at >= CURRENT_DATE
+  AND t.deleted_at IS NULL
+GROUP BY username
+HAVING COUNT(*) >= 5;
+```
+
+### Best Practices
+
+1. **Set reasonable defaults**: 5-10 messages/day for free tier
+2. **Use user-specific overrides**: For paid users or VIPs
+3. **Monitor usage patterns**: Adjust limits based on actual usage
+4. **Communicate limits clearly**: Show in UI how many messages remain
+5. **Provide upgrade path**: Offer higher limits for paid plans
 
 ---
 
